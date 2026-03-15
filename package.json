@@ -1,0 +1,14 @@
+{
+  "name": "flop-checker",
+  "version": "1.0.0",
+  "description": "Script de vérification pour la billetterie Arts et Métiers",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "nodemailer": "^8.0.2"
+  }
+}
