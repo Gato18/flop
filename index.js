@@ -1,129 +1,266 @@
 import fs from 'fs';
+import path from 'path';
+import http from 'http';
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 
-// Charger les variables d'environnement depuis le fichier .env
 dotenv.config();
 
-const URL_PAGE = "https://www.arts-et-metiers.net/musee/flops";
-const TEXT_TO_CHECK = "Billetterie en ligne temporairement indisponible";
-const URL_TICKET = "https://arts-et-metiers.tickeasy.com/fr-FR/accueil";
+const SITE_PAGE_URL = process.env.SITE_PAGE_URL || 'https://www.arts-et-metiers.net/';
+const EXPECTED_BILLETTERIE_URL = normalizeUrl(
+    process.env.EXPECTED_BILLETTERIE_URL ||
+    'https://www.arts-et-metiers.net/musee/billetterie-en-ligne-temporairement-indisponible'
+);
+const STATE_FILE = process.env.STATE_FILE || './flop-state.json';
+const PORT = process.env.PORT || 3000;
+const RUN_ONCE = process.env.RUN_ONCE === 'true';
+const CHECK_INTERVAL_MS = getCheckIntervalMs();
+const REQUEST_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'
+};
+const MISSING_BUTTON_SENTINEL = '__missing_billetterie_button__';
 
-const ONE_HOUR_MS = 60 * 60 * 1000; // 1 heure en millisecondes
-
-// Configuration du transporteur d'email
 const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: process.env.SMTP_PORT || 587,
-    secure: process.env.SMTP_SECURE === 'true', // true pour 465, false pour les autres ports
+    secure: process.env.SMTP_SECURE === 'true',
     auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS
     }
 });
 
+function getCheckIntervalMs() {
+    const minutes = Number(process.env.CHECK_INTERVAL_MINUTES || 60);
+
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+        return 60 * 60 * 1000;
+    }
+
+    return minutes * 60 * 1000;
+}
+
+function normalizeUrl(rawUrl) {
+    try {
+        const url = new URL(rawUrl, SITE_PAGE_URL);
+        url.hash = '';
+        return url.toString();
+    } catch {
+        return String(rawUrl || '').trim();
+    }
+}
+
+function loadState() {
+    try {
+        if (!fs.existsSync(STATE_FILE)) {
+            return {
+                lastSeenHref: null,
+                lastAlertedHref: null
+            };
+        }
+
+        const rawState = fs.readFileSync(STATE_FILE, 'utf8');
+        const parsedState = JSON.parse(rawState);
+
+        return {
+            lastSeenHref: parsedState.lastSeenHref || null,
+            lastAlertedHref: parsedState.lastAlertedHref || null
+        };
+    } catch (error) {
+        console.error(`[⚠️ AVERTISSEMENT] Impossible de lire ${STATE_FILE} :`, error.message);
+        return {
+            lastSeenHref: null,
+            lastAlertedHref: null
+        };
+    }
+}
+
+function saveState(state) {
+    try {
+        const directory = path.dirname(STATE_FILE);
+        if (directory && directory !== '.') {
+            fs.mkdirSync(directory, { recursive: true });
+        }
+
+        fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+    } catch (error) {
+        console.error(`[⚠️ AVERTISSEMENT] Impossible d'écrire ${STATE_FILE} :`, error.message);
+    }
+}
+
+function extractBilletterieHref(html) {
+    const anchors = html.matchAll(/<a\b([^>]*)>\s*Billetterie\s*<\/a>/gi);
+
+    for (const anchor of anchors) {
+        const attributes = anchor[1] || '';
+        const hrefMatch = attributes.match(/\bhref="([^"]+)"/i);
+
+        if (!hrefMatch?.[1]) {
+            continue;
+        }
+
+        const classValue = attributes.match(/\bclass="([^"]+)"/i)?.[1] || '';
+
+        if (!classValue || classValue.includes('header-billetterie-link')) {
+            return normalizeUrl(hrefMatch[1]);
+        }
+    }
+
+    return null;
+}
+
 async function sendAlertEmail(subject, text) {
     if (!process.env.EMAIL_TO || !process.env.SMTP_USER) {
         console.log(`[⚠️ AVERTISSEMENT] Configuration email manquante (EMAIL_TO ou SMTP_USER), email non envoyé.`);
-        return;
+        return false;
     }
 
     try {
         await transporter.sendMail({
             from: `"Flop Checker" <${process.env.SMTP_USER}>`,
             to: process.env.EMAIL_TO,
-            subject: subject,
-            text: text,
+            subject,
+            text,
         });
         console.log(`[📧 SUCCÈS] Email d'alerte envoyé vers ${process.env.EMAIL_TO}`);
+        return true;
     } catch (error) {
         console.error(`[📧 ERREUR] Échec de l'envoi de l'email :`, error.message);
+        return false;
     }
 }
 
-async function checkUrls() {
-    const timestamp = new Date().toLocaleString('fr-FR');
-    console.log(`\n======================================================`);
-    console.log(`[${timestamp}] Début de la vérification des liens`);
-    console.log(`======================================================`);
-
-    let alertReasons = [];
-
-    // 1. Vérifie si le texte est présent sur le site du musée
-    try {
-        const response1 = await fetch(URL_PAGE, {
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
-            }
-        });
-        
-        if (!response1.ok) {
-            console.error(`[❌ ERREUR] Impossible d'accéder à la page du musée. Code HTTP: ${response1.status}`);
-        } else {
-            const text = await response1.text();
-            if (text.includes(TEXT_TO_CHECK)) {
-                console.log(`[🔒 INFO] Statut normal: le texte "${TEXT_TO_CHECK}" est bien PRÉSENT. La billetterie semble toujours indisponible.`);
-            } else {
-                console.log(`[🚨 ALERTE] CHANGEMENT DÉTECTÉ: Le texte "${TEXT_TO_CHECK}" N'EST PLUS PRÉSENT sur la page !`);
-                alertReasons.push(`La page Musée (${URL_PAGE}) n'affiche plus le texte de billetterie indisponible.`);
-            }
-        }
-    } catch (e) {
-        console.error(`[❌ ERREUR] Exception lors de la requête vers la page du musée:`, e.message);
+async function sendAlertSummary(timestamp, alertReasons) {
+    if (alertReasons.length === 0) {
+        return false;
     }
 
-    console.log(`------------------------------------------------------`);
+    console.log(`\n[🚨 ALERTE] Au moins une condition est remplie. Envoi d'un email...`);
+    const subject = `[ALERTE] Billetterie Arts et Métiers : lien modifié`;
+    const body = `Bonjour,\n\nUn changement a été détecté lors de la vérification du ${timestamp} :\n\n- ${alertReasons.join('\n- ')}\n\nVérifiez la billetterie du musée.\n\nL'application Flop Checker.`;
 
-    // 2. Vérifie si le site de la billetterie répond un code 200
-    try {
-        const response2 = await fetch(URL_TICKET, {
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
-            }
-        });
-        
-        if (response2.status === 200) {
-            console.log(`[✅ INFO] Le site de la billetterie (tickeasy) répond bien avec un code 200 (En ligne).`);
-            alertReasons.push(`Le site de la billetterie (${URL_TICKET}) répond avec un code HTTP 200.`);
-        } else {
-            console.log(`[⚠️ INFO] Le site de la billetterie répond avec un code ${response2.status} (différent de 200).`);
-        }
-    } catch (e) {
-        console.error(`[❌ ERREUR] Exception lors de la requête vers le site de la billetterie:`, e.message);
-    }
-    
-    // 3. Envoi de l'email si une des conditions est remplie
-    if (alertReasons.length > 0) {
-        console.log(`\n[🚨 ALERTE] Au moins une condition est remplie. Envoi d'un email...`);
-        const subject = `[ALERTE] Mouvement sur la billetterie Arts et Métiers !`;
-        const body = `Bonjour,\n\nUne ou plusieurs conditions ont été détectées lors de la vérification de ${timestamp} :\n\n- ` + alertReasons.join('\n- ') + `\n\nAllez vite vérifier !\n\nL'application Flop Checker.`;
-        
-        await sendAlertEmail(subject, body);
-    }
+    return sendAlertEmail(subject, body);
+}
 
+function logCheckEnd(timestamp) {
     console.log(`======================================================`);
     console.log(`[${timestamp}] Fin de la vérification.`);
-    console.log(`Prochaine exécution dans 1 heure.`);
+    console.log(`Prochaine exécution dans ${Math.round(CHECK_INTERVAL_MS / 60000)} minute(s).`);
     console.log(`======================================================\n`);
 }
 
-// Exécuter une première fois immédiatement
-checkUrls();
+async function checkBilletterieLink() {
+    const timestamp = new Date().toLocaleString('fr-FR');
+    const state = loadState();
+    const alertReasons = [];
+    let pendingAlertMarker = null;
 
-// Puis programmer l'exécution toutes les heures
-setInterval(checkUrls, ONE_HOUR_MS);
+    console.log(`\n======================================================`);
+    console.log(`[${timestamp}] Début de la vérification de la billetterie`);
+    console.log(`======================================================`);
 
-console.log(`L'application de surveillance est lancée !`);
-console.log(`Fréquence de vérification : toutes les heures.`);
+    try {
+        const response = await fetch(SITE_PAGE_URL, {
+            headers: REQUEST_HEADERS
+        });
 
-// Création d'un serveur HTTP factice pour Render
-import http from 'http';
-const PORT = process.env.PORT || 3000;
+        if (!response.ok) {
+            console.error(`[❌ ERREUR] Impossible d'accéder à la page ${SITE_PAGE_URL}. Code HTTP : ${response.status}`);
+            logCheckEnd(timestamp);
+            return;
+        }
 
-http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.write('Flop Checker en ligne et en cours de surveillance !');
-    res.end();
-}).listen(PORT, () => {
-    console.log(`[🌐 INFO] Serveur web factice à l'écoute sur le port ${PORT} (requis pour Render)`);
-});
+        const html = await response.text();
+        const currentHref = extractBilletterieHref(html);
+
+        if (!currentHref) {
+            console.error(`[❌ ERREUR] Impossible de retrouver le bouton Billetterie sur ${SITE_PAGE_URL}.`);
+
+            if (state.lastAlertedHref !== MISSING_BUTTON_SENTINEL) {
+                alertReasons.push(`Le bouton Billetterie est introuvable sur ${SITE_PAGE_URL}. La page a peut-être changé.`);
+                pendingAlertMarker = MISSING_BUTTON_SENTINEL;
+            }
+
+            const emailSent = await sendAlertSummary(timestamp, alertReasons);
+            if (emailSent && pendingAlertMarker) {
+                state.lastAlertedHref = pendingAlertMarker;
+            }
+
+            saveState(state);
+            logCheckEnd(timestamp);
+            return;
+        }
+
+        console.log(`[🔗 INFO] Lien détecté : ${currentHref}`);
+
+        if (state.lastSeenHref && state.lastSeenHref !== currentHref) {
+            console.log(`[📝 INFO] Ancien lien détecté : ${state.lastSeenHref}`);
+        }
+
+        state.lastSeenHref = currentHref;
+
+        if (currentHref === EXPECTED_BILLETTERIE_URL) {
+            console.log(`[🔒 INFO] Le bouton Billetterie pointe toujours vers la page d'indisponibilité attendue.`);
+
+            if (state.lastAlertedHref) {
+                console.log(`[↩️ INFO] Retour à l'URL attendue. Une prochaine réouverture déclenchera un nouvel email.`);
+                state.lastAlertedHref = null;
+            }
+
+            saveState(state);
+            logCheckEnd(timestamp);
+            return;
+        }
+
+        console.log(`[🚨 ALERTE] Le lien du bouton Billetterie a changé.`);
+
+        if (state.lastAlertedHref !== currentHref) {
+            alertReasons.push(
+                `Le bouton Billetterie de ${SITE_PAGE_URL} pointe maintenant vers ${currentHref} au lieu de ${EXPECTED_BILLETTERIE_URL}.`
+            );
+            pendingAlertMarker = currentHref;
+        } else {
+            console.log(`[ℹ️ INFO] Ce nouveau lien a déjà déclenché une alerte, aucun nouvel email envoyé.`);
+        }
+
+    } catch (error) {
+        console.error(`[❌ ERREUR] Exception lors de la vérification :`, error.message);
+        logCheckEnd(timestamp);
+        return;
+    }
+
+    const emailSent = await sendAlertSummary(timestamp, alertReasons);
+    if (emailSent && pendingAlertMarker) {
+        state.lastAlertedHref = pendingAlertMarker;
+    }
+
+    saveState(state);
+    logCheckEnd(timestamp);
+}
+
+function startHealthServer() {
+    http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.write('Flop Checker en ligne et en cours de surveillance !');
+        res.end();
+    }).listen(PORT, () => {
+        console.log(`[🌐 INFO] Serveur web factice à l'écoute sur le port ${PORT} (requis pour Render)`);
+    });
+}
+
+async function startMonitoring() {
+    if (!RUN_ONCE) {
+        startHealthServer();
+        setInterval(checkBilletterieLink, CHECK_INTERVAL_MS);
+        console.log(`L'application de surveillance est lancée !`);
+        console.log(`Fréquence de vérification : toutes les ${Math.round(CHECK_INTERVAL_MS / 60000)} minute(s).`);
+    }
+
+    await checkBilletterieLink();
+
+    if (RUN_ONCE) {
+        console.log(`[🧪 INFO] Mode RUN_ONCE activé : fin du script après cette vérification.`);
+    }
+}
+
+startMonitoring();
